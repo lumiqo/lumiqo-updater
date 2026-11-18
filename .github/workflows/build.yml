@@ -1,0 +1,60 @@
+name: Build and release
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - run: go test ./...
+      - name: Build Linux binaries and checksums
+        env:
+          CGO_ENABLED: '0'
+          GOOS: linux
+        run: |
+          mkdir -p dist
+          for arch in amd64 arm64; do
+            GOARCH="$arch" go build -trimpath \
+              -o "dist/lumiqo-updater-linux-$arch" .
+          done
+          cp systemd/lumiqo-updater.service systemd/lumiqo-updater.timer dist/
+          cd dist
+          sha256sum lumiqo-updater-linux-* lumiqo-updater.service lumiqo-updater.timer > SHA256SUMS
+      - uses: actions/upload-artifact@v6
+        with:
+          name: lumiqo-updater-linux
+          path: dist/
+          if-no-files-found: error
+
+  release:
+    if: github.event_name == 'push' && github.ref_type == 'tag'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v7
+        with:
+          name: lumiqo-updater-linux
+          path: dist
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          gh release create "$RELEASE_TAG" --verify-tag --generate-notes \
+            dist/lumiqo-updater-linux-amd64 dist/lumiqo-updater-linux-arm64 dist/SHA256SUMS dist/lumiqo-updater.service dist/lumiqo-updater.timer

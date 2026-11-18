@@ -1,0 +1,14 @@
+[Unit]
+Description=Update Lumiqo Manager
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+EnvironmentFile=-/etc/lumiqo/updater.env
+ExecStart=/opt/lumiqo/updater/lumiqo-updater
+TimeoutStartSec=4min
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/opt/lumiqo/manager

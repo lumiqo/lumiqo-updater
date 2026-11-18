@@ -1,0 +1,10 @@
+[Unit]
+Description=Check for Lumiqo Manager updates
+
+[Timer]
+OnCalendar=daily
+Persistent=true
+RandomizedDelaySec=30min
+
+[Install]
+WantedBy=timers.target
