@@ -25,9 +25,11 @@ import (
 )
 
 const (
-	managerAPI = "https://api.github.com/repos/lumiqo/lumiqo-manager"
-	binaryName = "lumiqo-manager"
-	maxBinary  = 128 << 20
+	managerAPI       = "https://api.github.com/repos/lumiqo/lumiqo-manager"
+	binaryName       = "lumiqo-manager"
+	maxBinary        = 128 << 20
+	updateTimeout    = 3 * time.Minute
+	reconcileTimeout = 20 * time.Minute
 )
 
 var stableTag = regexp.MustCompile(`^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$`)
@@ -171,7 +173,7 @@ func activate(ctx context.Context, root, target, tag string) error {
 	return os.Rename(link, filepath.Join(root, "current"))
 }
 
-func update(ctx context.Context, root, arch string, r releases) error {
+func update(ctx context.Context, root, arch string, r releases, repairTimeout time.Duration) error {
 	if arch != "amd64" && arch != "arm64" {
 		return fmt.Errorf("unsupported architecture %s", arch)
 	}
@@ -187,6 +189,16 @@ func update(ctx context.Context, root, arch string, r releases) error {
 		}
 		return err
 	}
+	updateCtx, cancel := context.WithTimeout(ctx, updateTimeout)
+	err = updateManager(updateCtx, root, arch, r)
+	cancel()
+	if err != nil {
+		return err
+	}
+	return reconcileManager(ctx, root, repairTimeout)
+}
+
+func updateManager(ctx context.Context, root, arch string, r releases) error {
 	current, err := os.Readlink(filepath.Join(root, "current"))
 	if err != nil {
 		return fmt.Errorf("read Manager current link: %w", err)
@@ -248,6 +260,37 @@ func update(ctx context.Context, root, arch string, r releases) error {
 	return nil
 }
 
+func reconcileManager(ctx context.Context, root string, timeout time.Duration) error {
+	log.Print("applying Manager environment differences")
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, filepath.Join(root, "current", binaryName), "reconcile", "--apply")
+	cmd.Dir = "/"
+	cmd.Env = []string{
+		"PATH=/usr/sbin:/usr/bin:/sbin:/bin",
+		"HOME=/root",
+		"LANG=C.UTF-8",
+		"DEBIAN_FRONTEND=noninteractive",
+	}
+	cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
+	// Cancel the whole command group, including apt and its children.
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Cancel = func() error {
+		err := syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+		if errors.Is(err, syscall.ESRCH) {
+			return os.ErrProcessDone
+		}
+		return err
+	}
+	if err := cmd.Run(); err != nil {
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			return fmt.Errorf("Manager reconcile --apply timed out after %s: %w", timeout, ctx.Err())
+		}
+		return fmt.Errorf("Manager reconcile --apply: %w", err)
+	}
+	return nil
+}
+
 func stage(ctx context.Context, root, versionDir, name, digest string, rel release, r releases) error {
 	dir, err := os.MkdirTemp(filepath.Join(root, "versions"), ".download-")
 	if err != nil {
@@ -288,6 +331,9 @@ func main() {
 	if !filepath.IsAbs(*root) || flag.NArg() != 0 {
 		log.Fatal("expected an absolute Manager installation directory and no positional arguments")
 	}
+	if os.Geteuid() != 0 {
+		log.Fatal("Updater requires root")
+	}
 	client := &http.Client{
 		Timeout: time.Minute,
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
@@ -298,9 +344,7 @@ func main() {
 			return nil
 		},
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
-	defer cancel()
-	if err := update(ctx, *root, runtime.GOARCH, releases{client, managerAPI, os.Getenv("GH_TOKEN")}); err != nil {
+	if err := update(context.Background(), *root, runtime.GOARCH, releases{client, managerAPI, os.Getenv("GH_TOKEN")}, reconcileTimeout); err != nil {
 		log.Fatal(err)
 	}
 }

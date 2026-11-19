@@ -1,14 +1,18 @@
 [Unit]
-Description=Update Lumiqo Manager
+Description=Update Lumiqo Manager and apply environment differences
 Wants=network-online.target
 After=network-online.target
 
 [Service]
 Type=oneshot
+User=root
 EnvironmentFile=-/etc/lumiqo/updater.env
 ExecStart=/opt/lumiqo/updater/lumiqo-updater
-TimeoutStartSec=4min
+StandardOutput=journal
+StandardError=journal
+TimeoutStartSec=25min
 NoNewPrivileges=yes
-ProtectSystem=strict
-ProtectHome=yes
-ReadWritePaths=/opt/lumiqo/manager
+# apt and its maintainer scripts need to write to system paths such as /usr and /etc.
+ProtectSystem=no
+ProtectHome=read-only
+ReadWritePaths=/home/lumiqo
