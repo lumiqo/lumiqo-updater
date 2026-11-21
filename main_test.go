@@ -20,6 +20,7 @@ func TestUpdate(t *testing.T) {
 	t.Setenv("GH_TOKEN", "updater-only")
 	const current = "versions/v1.9.0"
 	good := fakeManager("v1.10.0", "exit 0")
+	disabled := fakeManager("v1.10.0", `test "$(cat "${dir%/*}/service-home/.local/state/lumiqot/services/worker")" = disabled`)
 	oldBinary := fakeManager("v1.9.0", "exit 0")
 	repairFailure := fakeManager("v1.10.0", "exit 42")
 	repairTimeout := fakeManager("v1.10.0", "sleep 60 & wait")
@@ -29,6 +30,7 @@ func TestUpdate(t *testing.T) {
 		wantRepair, wantError               string
 	}{
 		{"upgrade", "v1.10.0", good, good, "versions/v1.10.0", "v1.10.0", ""},
+		{"upgrade with Worker disabled", "v1.10.0", disabled, disabled, "versions/v1.10.0", "v1.10.0", ""},
 		{"hash mismatch", "v1.10.0", "corrupt", good, current, "", "SHA-256 mismatch"},
 		{"version probe failed", "v1.10.0", "#!/bin/sh\nexit 1\n", "#!/bin/sh\nexit 1\n", current, "", "version probe"},
 		{"version mismatch", "v2.0.0", good, good, current, "", "did not report version"},
@@ -39,6 +41,15 @@ func TestUpdate(t *testing.T) {
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			root := t.TempDir()
+			preference := filepath.Join(root, "service-home/.local/state/lumiqot/services/worker")
+			if tt.name == "upgrade with Worker disabled" {
+				if err := os.MkdirAll(filepath.Dir(preference), 0700); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(preference, []byte("disabled\n"), 0600); err != nil {
+					t.Fatal(err)
+				}
+			}
 			oldDir := filepath.Join(root, current)
 			if err := os.MkdirAll(oldDir, 0755); err != nil {
 				t.Fatal(err)
@@ -80,6 +91,11 @@ func TestUpdate(t *testing.T) {
 				checkRepairLog(t, root)
 			} else {
 				checkRepairLog(t, root, tt.wantRepair)
+			}
+			if tt.name == "upgrade with Worker disabled" {
+				if data, err := os.ReadFile(preference); err != nil || string(data) != "disabled\n" {
+					t.Fatalf("service preference = %q, %v", data, err)
+				}
 			}
 			got, err := os.Readlink(link)
 			if err != nil || got != tt.want {
