@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -15,6 +16,70 @@ import (
 	"testing"
 	"time"
 )
+
+func TestReleaseSources(t *testing.T) {
+	for _, scenario := range []string{"public", "latest fallback", "asset fallback"} {
+		t.Run(scenario, func(t *testing.T) {
+			const tag = "v1.2.3"
+			apiCalls := 0
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if strings.HasPrefix(r.URL.Path, "/api/") {
+					apiCalls++
+					if r.Header.Get("Authorization") != "Bearer updater-only" {
+						t.Error("API request missing configured token")
+					}
+				} else if r.Header.Get("Authorization") != "" {
+					t.Error("public request carried a token")
+				}
+				switch r.URL.Path {
+				case "/public/releases/latest":
+					if scenario == "latest fallback" {
+						http.Error(w, "unavailable", http.StatusServiceUnavailable)
+					} else {
+						http.Redirect(w, r, "/public/releases/tag/"+tag, http.StatusFound)
+					}
+				case "/public/releases/download/" + tag + "/SHA256SUMS":
+					if scenario == "asset fallback" {
+						http.NotFound(w, r)
+					} else {
+						fmt.Fprint(w, "checksums")
+					}
+				case "/api/releases/latest", "/api/releases/tags/" + tag:
+					fmt.Fprintf(w, `{"tag_name":%q,"assets":[{"id":1,"name":"SHA256SUMS"}]}`, tag)
+				case "/api/releases/assets/1":
+					fmt.Fprint(w, "checksums")
+				default:
+					t.Errorf("unexpected request: %s", r.URL.Path)
+					http.NotFound(w, r)
+				}
+			}))
+			defer server.Close()
+			source := releases{client: server.Client(), api: server.URL + "/api",
+				public: server.URL + "/public", token: "updater-only"}
+			ctx := context.Background()
+			rel, err := source.latest(ctx)
+			if err != nil || rel.Tag != tag {
+				t.Fatalf("latest = %q, %v", rel.Tag, err)
+			}
+			body, err := source.asset(ctx, &rel, "SHA256SUMS")
+			if err != nil {
+				t.Fatal(err)
+			}
+			data, err := io.ReadAll(body)
+			body.Close()
+			if err != nil || string(data) != "checksums" {
+				t.Fatalf("asset = %q, %v", data, err)
+			}
+			wantAPICalls := 2
+			if scenario == "public" {
+				wantAPICalls = 0
+			}
+			if apiCalls != wantAPICalls {
+				t.Fatalf("API calls = %d, want %d", apiCalls, wantAPICalls)
+			}
+		})
+	}
+}
 
 func TestUpdate(t *testing.T) {
 	t.Setenv("GH_TOKEN", "updater-only")

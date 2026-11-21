@@ -26,6 +26,7 @@ import (
 
 const (
 	managerAPI       = "https://api.github.com/repos/lumiqo/lumiqo-manager"
+	managerPublic    = "https://github.com/lumiqo/lumiqo-manager"
 	binaryName       = "lumiqo-manager"
 	maxBinary        = 128 << 20
 	updateTimeout    = 3 * time.Minute
@@ -35,6 +36,7 @@ const (
 var stableTag = regexp.MustCompile(`^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$`)
 
 type release struct {
+	public     bool
 	Tag        string `json:"tag_name"`
 	Draft      bool   `json:"draft"`
 	Prerelease bool   `json:"prerelease"`
@@ -48,16 +50,17 @@ type releases struct {
 	client *http.Client
 	api    string
 	token  string
+	public string
 }
 
-func (r releases) get(ctx context.Context, path, accept string) (io.ReadCloser, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, r.api+path, nil)
+func (r releases) get(ctx context.Context, base, path, accept, token string) (io.ReadCloser, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, base+path, nil)
 	if err != nil {
 		return nil, err
 	}
 	req.Header.Set("Accept", accept)
-	if r.token != "" {
-		req.Header.Set("Authorization", "Bearer "+r.token)
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
 	}
 	resp, err := r.client.Do(req)
 	if err != nil {
@@ -75,7 +78,79 @@ func (r releases) get(ctx context.Context, path, accept string) (io.ReadCloser, 
 	return resp.Body, nil
 }
 
-func (r releases) asset(ctx context.Context, rel release, name string) (io.ReadCloser, error) {
+func (r releases) publicLatest(ctx context.Context) (string, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, r.public+"/releases/latest", nil)
+	if err != nil {
+		return "", err
+	}
+	client := *r.client
+	client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	switch resp.StatusCode {
+	case http.StatusMovedPermanently, http.StatusFound, http.StatusSeeOther, http.StatusTemporaryRedirect, http.StatusPermanentRedirect:
+	default:
+		return "", fmt.Errorf("expected latest release redirect, got %s", resp.Status)
+	}
+	target, err := resp.Location()
+	if err != nil {
+		return "", err
+	}
+	prefix := strings.TrimSuffix(req.URL.Path, "/latest") + "/tag/"
+	tag, found := strings.CutPrefix(target.Path, prefix)
+	if target.Scheme != req.URL.Scheme || target.Host != req.URL.Host || target.User != nil ||
+		!found || !stableTag.MatchString(tag) {
+		return "", errors.New("unexpected latest release redirect")
+	}
+	return tag, nil
+}
+
+func (r releases) apiRelease(ctx context.Context, path string) (release, error) {
+	body, err := r.get(ctx, r.api, path, "application/vnd.github+json", r.token)
+	if err != nil {
+		return release{}, err
+	}
+	defer body.Close()
+	var rel release
+	if err := json.NewDecoder(io.LimitReader(body, 1<<20)).Decode(&rel); err != nil {
+		return release{}, err
+	}
+	if rel.Draft || rel.Prerelease || !stableTag.MatchString(rel.Tag) {
+		return release{}, fmt.Errorf("unexpected stable Manager release %q", rel.Tag)
+	}
+	return rel, nil
+}
+
+func (r releases) latest(ctx context.Context) (release, error) {
+	if r.public != "" {
+		tag, err := r.publicLatest(ctx)
+		if err == nil {
+			return release{Tag: tag, public: true}, nil
+		}
+		log.Printf("public Manager release lookup failed; trying GitHub API: %v", err)
+	}
+	return r.apiRelease(ctx, "/releases/latest")
+}
+
+func (r releases) asset(ctx context.Context, rel *release, name string) (io.ReadCloser, error) {
+	if rel.public {
+		body, err := r.get(ctx, r.public, "/releases/download/"+rel.Tag+"/"+name, "application/octet-stream", "")
+		if err == nil {
+			return body, nil
+		}
+		log.Printf("public Manager asset download failed; trying GitHub API: %v", err)
+		apiRel, apiErr := r.apiRelease(ctx, "/releases/tags/"+rel.Tag)
+		if apiErr != nil {
+			return nil, apiErr
+		}
+		if apiRel.Tag != rel.Tag {
+			return nil, errors.New("GitHub API returned a different Manager release tag")
+		}
+		*rel = apiRel
+	}
 	var id int64
 	for _, asset := range rel.Assets {
 		if asset.Name == name {
@@ -88,7 +163,7 @@ func (r releases) asset(ctx context.Context, rel release, name string) (io.ReadC
 	if id == 0 {
 		return nil, fmt.Errorf("release %s is missing %s", rel.Tag, name)
 	}
-	return r.get(ctx, fmt.Sprintf("/releases/assets/%d", id), "application/octet-stream")
+	return r.get(ctx, r.api, fmt.Sprintf("/releases/assets/%d", id), "application/octet-stream", r.token)
 }
 
 func newer(candidate, current string) bool {
@@ -208,18 +283,9 @@ func updateManager(ctx context.Context, root, arch string, r releases) error {
 		return fmt.Errorf("unexpected Manager current target %q, expected versions/vMAJOR.MINOR.PATCH", current)
 	}
 
-	body, err := r.get(ctx, "/releases/latest", "application/vnd.github+json")
+	rel, err := r.latest(ctx)
 	if err != nil {
 		return err
-	}
-	var rel release
-	err = json.NewDecoder(io.LimitReader(body, 1<<20)).Decode(&rel)
-	body.Close()
-	if err != nil {
-		return err
-	}
-	if rel.Draft || rel.Prerelease || !stableTag.MatchString(rel.Tag) {
-		return fmt.Errorf("unexpected stable Manager release %q", rel.Tag)
 	}
 	if !newer(rel.Tag, currentTag) {
 		log.Printf("Manager %s is current", currentTag)
@@ -227,7 +293,7 @@ func updateManager(ctx context.Context, root, arch string, r releases) error {
 	}
 
 	name := binaryName + "-linux-" + arch
-	body, err = r.asset(ctx, rel, "SHA256SUMS")
+	body, err := r.asset(ctx, &rel, "SHA256SUMS")
 	if err != nil {
 		return err
 	}
@@ -247,7 +313,7 @@ func updateManager(ctx context.Context, root, arch string, r releases) error {
 			return fmt.Errorf("existing Manager %s: %w", rel.Tag, err)
 		}
 	case errors.Is(err, os.ErrNotExist):
-		if err := stage(ctx, root, versionDir, name, digest, rel, r); err != nil {
+		if err := stage(ctx, root, versionDir, name, digest, &rel, r); err != nil {
 			return err
 		}
 	default:
@@ -291,7 +357,7 @@ func reconcileManager(ctx context.Context, root string, timeout time.Duration) e
 	return nil
 }
 
-func stage(ctx context.Context, root, versionDir, name, digest string, rel release, r releases) error {
+func stage(ctx context.Context, root, versionDir, name, digest string, rel *release, r releases) error {
 	dir, err := os.MkdirTemp(filepath.Join(root, "versions"), ".download-")
 	if err != nil {
 		return err
@@ -344,7 +410,8 @@ func main() {
 			return nil
 		},
 	}
-	if err := update(context.Background(), *root, runtime.GOARCH, releases{client, managerAPI, os.Getenv("GH_TOKEN")}, reconcileTimeout); err != nil {
+	source := releases{client: client, api: managerAPI, token: os.Getenv("GH_TOKEN"), public: managerPublic}
+	if err := update(context.Background(), *root, runtime.GOARCH, source, reconcileTimeout); err != nil {
 		log.Fatal(err)
 	}
 }
